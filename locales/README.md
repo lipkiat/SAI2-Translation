@@ -1,2 +1,2 @@
-¹Ù·½ÈÕÎÄ°æ https://www.systemax.jp/ja/sai/devdept.html
-¹Ù·½Ó¢ÎÄ°æ https://www.systemax.jp/en/sai/devdept.html
+å®˜æ–¹æ—¥æ–‡ç‰ˆ https://www.systemax.jp/ja/sai/devdept.html
+å®˜æ–¹è‹±æ–‡ç‰ˆ https://www.systemax.jp/en/sai/devdept.html

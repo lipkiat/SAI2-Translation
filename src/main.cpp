@@ -16,11 +16,37 @@
 
 #include "pe.h"
 
+struct SAI_LocalizationEntry
+{
+	UINT_PTR name; // key
+	UINT_PTR text; // value
+	size_t id;
+};
+
+enum class SAI_LocalizationDomain
+{
+    Main, MainTip, Import, Option, Errdlg
+};
+
+enum class SAI_LocalizationLanguage
+{
+    Japanese, English
+};
+
+
+struct QueueInfo
+{
+	SAI_LocalizationEntry* lang;
+	wchar_t* value;
+};
+
+std::vector<QueueInfo> queues;
+
 void my_printf(const char* format, ...)
 {
 	va_list ap;
 	va_start(ap, format);
-	char buffer[1024];
+	char buffer[2048];
 	memset(buffer, 0, sizeof(buffer));
 	int length = wvsprintfA(buffer, format, ap);
 	va_end(ap);
@@ -31,11 +57,44 @@ void my_wprintf(const wchar_t* format, ...)
 {
 	va_list ap;
 	va_start(ap, format);
-	wchar_t buffer[1024];
+	wchar_t buffer[2048];
 	memset(buffer, 0, sizeof(buffer));
 	int length = wvsprintfW(buffer, format, ap);
 	va_end(ap);
 	WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), buffer, length, NULL, NULL);
+}
+
+void my_fprintf(HANDLE hFile, const wchar_t* format, ...)
+{
+	va_list ap;
+	va_start(ap, format);
+	wchar_t buffer[2048];
+	memset(buffer, 0, sizeof(buffer));
+	int length = wvsprintfW(buffer, format, ap);
+	va_end(ap);
+	DWORD bytesWritten;
+	length = length * 2;
+    WriteFile(hFile, buffer, length, &bytesWritten, NULL);
+}
+
+UINT_PTR ToBufferAddress(PE_HANDLE hPE, UINT_PTR Address)
+{
+	Address -= hPE->ImageBase;
+	if (Address > hPE->ImageSize)
+	{
+		return NULL;
+	}
+	return Address + (UINT_PTR)hPE->buffer;
+}
+
+UINT_PTR ToVirtualAddress(PE_HANDLE hPE, UINT_PTR Address)
+{
+	Address -= (UINT_PTR)hPE->buffer;
+	if (Address > hPE->ImageSize)
+	{
+		return NULL;
+	}
+	return Address + hPE->ImageBase;
 }
 
 wchar_t *escape_special_wchars(const wchar_t *src)
@@ -140,38 +199,21 @@ public:
 	}
 private:
 	std::multimap<size_t, uintptr_t> free_blocks_;
-};
+} pool;
 
-UINT_PTR ToBufferAddress(PE_HANDLE hPE, UINT_PTR Address)
-{
-	Address -= hPE->ImageBase;
-	if (Address > hPE->ImageSize)
-	{
-		return NULL;
-	}
-	return Address + (UINT_PTR)hPE->buffer;
-}
 
-UINT_PTR ToVirtualAddress(PE_HANDLE hPE, UINT_PTR Address)
+void printLang(PE_HANDLE hPE, UINT_PTR Address, wchar_t* file_name)
 {
-	Address -= (UINT_PTR)hPE->buffer;
-	if (Address > hPE->ImageSize)
-	{
-		return NULL;
-	}
-	return Address + hPE->ImageBase;
-}
+	HANDLE hFile = CreateFile(file_name, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hFile == INVALID_HANDLE_VALUE) {
+        my_wprintf(L"无法创建文件 (%d).\n", GetLastError());
+        return;
+    }
+	BYTE bom[] = {0xFF, 0xFE};
+	DWORD bytesWritten;
+	WriteFile(hFile, bom, sizeof(bom), &bytesWritten, NULL);
 
-struct SAI_LocalLanguage
-{
-	UINT_PTR name;
-	UINT_PTR text;
-	size_t id;
-};
-
-void printLang(PE_HANDLE hPE, UINT_PTR Address)
-{
-	SAI_LocalLanguage* langs = (SAI_LocalLanguage*)ToBufferAddress(hPE, Address);
+	SAI_LocalizationEntry* langs = (SAI_LocalizationEntry*)ToBufferAddress(hPE, Address);
 	do {
 		wchar_t* name = (wchar_t*)ToBufferAddress(hPE, langs->name);
 		if (!name) break;
@@ -180,67 +222,19 @@ void printLang(PE_HANDLE hPE, UINT_PTR Address)
 		size_t id = langs->id;
 		//my_wprintf(L"%X ", id);
 		text = escape_special_wchars(text);
-		my_wprintf(L"%ls=%ls\n", name, text);
+		my_fprintf(hFile, L"%ls=%ls\n", name, text);
 		free(text);
 		langs++;
 	} while (true);
+
+	CloseHandle(hFile);
 }
 
-struct QueueInfo
+void changeLanguage(PE_HANDLE hPE, UINT_PTR Address, std::map<std::wstring, wchar_t*> &cfg)
 {
-	SAI_LocalLanguage* lang;
-	wchar_t* value;
-};
-std::vector<QueueInfo> queues;
-MemoryFragmentPool pool;
-
-
-int loadLangFile(PE_HANDLE hPE, const std::wstring filename, UINT_PTR Address)
-{
-	// 打开文件
-	std::wifstream fin(filename, std::ios::binary);
-	if (!fin)
-	{
-		my_wprintf(L"无法打开文件\n");
-		return 1;
-	}
-	// 设定 UTF‑16LE 的 locale
-	fin.imbue(std::locale(fin.getloc(), new std::codecvt_utf16<wchar_t, 0x10ffff, std::consume_header>));
-
-	// 读取并解析
-	std::map<std::wstring, wchar_t*> cfg;
-	std::wstring line;
-	while (std::getline(fin, line))
-	{
-		// 处理 Windows 换行符：getline 只会把 '\n' 去掉，残留 '\r' 需要手动去除
-		if (!line.empty() && line.back() == L'\r')
-			line.pop_back();
-		// 跳过空行和注释行（假设以 # 开头）
-		if (line.empty() || line[0] == L'#')
-			continue;
-		// 按等号分割
-		auto pos = line.find(L'=');
-		if (pos == std::wstring::npos)
-		{
-			my_wprintf(L"格式错误 (未找到 '='): %ls\n", line.c_str());
-			continue;
-		}
-		std::wstring key = line.substr(0, pos);
-		wchar_t* value = unescape_special_wchars(line.substr(pos + 1).c_str());
-		cfg[key] = value; // 插入/覆盖
-	}
-	// 结果演示
-	my_wprintf(L"读取完成，共 %d 条记录。\n", cfg.size());
-	/*
-	for (const auto& kv : cfg)
-	{
-		my_wprintf(L"%ls=%ls\n", kv.first.c_str(), kv.second.c_str());
-	}
-	*/
-
 	// 修改
 	{
-		SAI_LocalLanguage* langs = (SAI_LocalLanguage*)ToBufferAddress(hPE, Address);
+		SAI_LocalizationEntry* langs = (SAI_LocalizationEntry*)ToBufferAddress(hPE, Address);
 		do {
 			wchar_t* key = (wchar_t*)ToBufferAddress(hPE, langs->name);
 			if (!key) break;
@@ -292,7 +286,77 @@ int loadLangFile(PE_HANDLE hPE, const std::wstring filename, UINT_PTR Address)
 			langs++;
 		} while (true);
 	}
-	my_wprintf(L"\n");
+}
+
+wchar_t *target_language;
+
+void getLangFilePath(wchar_t* buffer, SAI_LocalizationDomain domain, wchar_t* language)
+{
+	wchar_t* file_name = NULL;
+	wcscpy_s(buffer, MAX_PATH, language);
+	switch(domain)
+	{
+		case SAI_LocalizationDomain::Main:
+			file_name = L"\\lang\\Main.txt";
+			break;
+		case SAI_LocalizationDomain::MainTip:
+			file_name = L"\\lang\\MainTip.txt";
+			break;
+		case SAI_LocalizationDomain::Import:
+			file_name = L"\\lang\\Import.txt";
+			break;
+		case SAI_LocalizationDomain::Option:
+			file_name = L"\\lang\\Option.txt";
+			break;
+		case SAI_LocalizationDomain::Errdlg:
+			file_name = L"\\lang\\Errdlg.txt";
+			break;
+	}
+	wcscat_s(buffer, MAX_PATH, file_name);
+}
+
+int loadLangFile(const std::wstring filename, std::map<std::wstring, wchar_t*> &cfg)
+{
+	// 打开文件
+	std::wifstream fin(filename, std::ios::binary);
+	if (!fin)
+	{
+		my_wprintf(L"无法打开文件\n");
+		return 1;
+	}
+	// 设定 UTF‑16LE 的 locale
+	fin.imbue(std::locale(fin.getloc(), new std::codecvt_utf16<wchar_t, 0x10ffff, std::consume_header>));
+
+	// 读取并解析
+	std::wstring line;
+	cfg.clear();
+	while (std::getline(fin, line))
+	{
+		// 处理 Windows 换行符：getline 只会把 '\n' 去掉，残留 '\r' 需要去除
+		if (!line.empty() && line.back() == L'\r')
+			line.pop_back();
+		// 跳过空行和注释行（假设以 # 开头）
+		if (line.empty() || line[0] == L'#')
+			continue;
+		// 按等号分割
+		auto pos = line.find(L'=');
+		if (pos == std::wstring::npos)
+		{
+			my_wprintf(L"格式错误 (未找到 '='): %ls\n", line.c_str());
+			continue;
+		}
+		std::wstring key = line.substr(0, pos);
+		wchar_t* value = unescape_special_wchars(line.substr(pos + 1).c_str());
+		cfg[key] = value; // 插入/覆盖
+	}
+	// 结果
+	my_wprintf(L"读取完成，共 %d 条记录。\n", cfg.size());
+	/*
+	for (const auto& kv : cfg)
+	{
+		my_wprintf(L"%ls=%ls\n", kv.first.c_str(), kv.second.c_str());
+	}
+	*/
 	return 0;
 }
 
@@ -300,7 +364,7 @@ void doQueue(PE_HANDLE hPE)
 {
 	for (const auto& q : queues)
 	{
-		SAI_LocalLanguage* lang = q.lang;
+		SAI_LocalizationEntry* lang = q.lang;
 		wchar_t* key = (wchar_t*)ToBufferAddress(hPE, lang->name);
 		wchar_t* text = (wchar_t*)ToBufferAddress(hPE, lang->text);
 		size_t id = lang->id;
@@ -318,28 +382,166 @@ void doQueue(PE_HANDLE hPE)
 	}
 }
 
+
+int is_english_string(const wchar_t *str) {
+    int en_count = 0; // 英文字符计数
+    int other_count = 0; // 非英文字符计数
+    while (*str != '\0') {
+        wchar_t c = *str;
+        str++;
+        // 忽略不可见字符
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+            continue;
+        }
+		// 忽略数字
+        if (c >= '0' && c <= '9') {
+            continue;
+        }
+
+        // 是否为半角英文字母
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+            en_count++;
+        } else {
+            other_count++;
+        }
+    }
+    return en_count > other_count ? 1 : 0;
+}
+
+UINT_PTR scanLanguage(PE_HANDLE hPE, std::map<std::wstring, wchar_t*> &cfg, SAI_LocalizationLanguage language)
+{
+	my_wprintf(L"正在尝试特征定位...\n");
+	BYTE* pEnd = hPE->buffer + hPE->ImageSize;
+	pEnd -= sizeof(SAI_LocalizationEntry);
+	// 为日文
+	int best_success_count = 0;
+	int best_other_count = 0;
+	SAI_LocalizationEntry* best_entry = NULL;
+	// 为英文
+	int best_success_count2 = 0;
+	int best_en_count = 0;
+	SAI_LocalizationEntry* best_entry2 = NULL;
+
+	for (BYTE* p = hPE->buffer; p < pEnd; p += sizeof(size_t))
+	{
+		int en_count = 0;
+		int other_count = 0;
+		int success_count = 0;
+		int failure_count = 0;
+		SAI_LocalizationEntry* entry = (SAI_LocalizationEntry*)p;
+		while((BYTE*)entry < pEnd)
+		{
+			if (entry->id == 0) break;
+			if (!(entry->name > hPE->ImageBase && entry->name < hPE->ImageBase + hPE->ImageSize))
+				break;
+			if (!(entry->text > hPE->ImageBase && entry->text < hPE->ImageBase + hPE->ImageSize))
+				break;
+			wchar_t* name = (wchar_t*)ToBufferAddress(hPE, entry->name);
+			if (!name) break;
+			wchar_t* text = (wchar_t*)ToBufferAddress(hPE, entry->text);
+			if (!text) break;
+			if (!is_english_string(name)) break;
+			//my_wprintf(L"%ls\n", name);
+			//my_wprintf(L"%ls\n", text);
+			if (is_english_string(text))
+			{
+				en_count++;
+			}
+			else
+			{
+				other_count++;
+			}
+			if (cfg[name])
+			{
+				success_count++;
+			}
+			else
+			{
+				failure_count++;
+			}
+			entry++;
+		}
+		if (success_count != 0 && success_count > failure_count)
+		{
+			if (other_count > en_count && success_count > best_success_count && other_count > best_other_count)
+			{
+				best_success_count = success_count;
+				best_other_count = other_count;
+				best_entry = (SAI_LocalizationEntry*)p;
+				my_wprintf(L"找到日文地址 %p\n", (void*)ToVirtualAddress(hPE, (UINT_PTR)p));
+				my_wprintf(L"  成功数量 %d\n", success_count);
+				my_wprintf(L"  失败数量 %d\n", failure_count);
+				my_wprintf(L"  英文数量 %d\n", en_count);
+				my_wprintf(L"  其它数量 %d\n", other_count);
+			}
+			if (en_count > other_count && success_count > best_success_count2 && en_count > best_en_count)
+			{
+				best_success_count2 = success_count;
+				best_en_count = en_count;
+				best_entry2 = (SAI_LocalizationEntry*)p;
+				my_wprintf(L"找到英文地址 %p\n", (void*)ToVirtualAddress(hPE, (UINT_PTR)p));
+				my_wprintf(L"  成功数量 %d\n", success_count);
+				my_wprintf(L"  失败数量 %d\n", failure_count);
+				my_wprintf(L"  英文数量 %d\n", en_count);
+				my_wprintf(L"  其它数量 %d\n", other_count);
+			}
+		}
+	}
+	my_wprintf(L"最佳日文地址 %p\n", (void*)ToVirtualAddress(hPE, (UINT_PTR)best_entry));
+	my_wprintf(L"最佳英文地址 %p\n", (void*)ToVirtualAddress(hPE, (UINT_PTR)best_entry2));
+	switch (language)
+	{
+		case SAI_LocalizationLanguage::Japanese:
+			return (UINT_PTR)ToVirtualAddress(hPE, (UINT_PTR)best_entry);
+		case SAI_LocalizationLanguage::English:
+			return (UINT_PTR)ToVirtualAddress(hPE, (UINT_PTR)best_entry2);
+	}
+	return 0;
+}
+
+void doTranslation(PE_HANDLE hPE, SAI_LocalizationDomain domain)
+{
+	wchar_t FilePath[MAX_PATH];
+	std::map<std::wstring, wchar_t*> cfg;
+	my_wprintf(L"\n");
+	// 日语（原始语言）
+	getLangFilePath(FilePath, domain, L"ja");
+	my_wprintf(L"原始语言文件：%ls\n", FilePath);
+	loadLangFile(FilePath, cfg);
+	UINT_PTR Address = scanLanguage(hPE, cfg, SAI_LocalizationLanguage::Japanese);
+	if (target_language)
+	{
+		// 目标语言
+		getLangFilePath(FilePath, domain, target_language);
+		my_wprintf(L"目标语言文件：%ls\n", FilePath);
+		loadLangFile(FilePath, cfg);
+		changeLanguage(hPE, Address, cfg);
+	}
+	else
+	{
+		// 进入打印模式
+		getLangFilePath(FilePath, domain, L".");
+		my_wprintf(L"文件：%ls\n", FilePath);
+		printLang(hPE, Address, FilePath);
+	}
+}
+
 int wmain(int argc, wchar_t *argv[])
 {
-	/*
-	for(int i = 0; i < argc; i++)
-	{
-		my_wprintf(L"%ls\n", argv[i]);
-	}
-	*/
-	wchar_t *OriginalFile;
-	wchar_t *Dir;
 	wchar_t FilePath[MAX_PATH];
+	wchar_t *OriginalFile = NULL;
 	if (argc > 1)
 	{
 		OriginalFile = argv[1];
 	}
 	if (argc > 2)
 	{
-		Dir = argv[2];
+		target_language = argv[2];
 		my_wprintf(L"原始文件：%ls\n", OriginalFile);
-		my_wprintf(L"目标目录：%ls\n", Dir);
+		my_wprintf(L"目标语言：%ls\n", target_language);
 	}
 
+	// 加载PE文件
 	PE_IMAGE image;
 	if (!LoadPEFile(&image, OriginalFile))
 	{
@@ -347,43 +549,26 @@ int wmain(int argc, wchar_t *argv[])
 		return 1;
 	}
 
-	// 注意：内存地址为硬编码，对应 SAI2 20241123（64位） 版本。
-	// 后续有必要时我们将尝试自动化的特征码定位。
-
-	if (!Dir)
+	// 加载语言并翻译
+	doTranslation(&image, SAI_LocalizationDomain::Main);
+	doTranslation(&image, SAI_LocalizationDomain::MainTip);
+	doTranslation(&image, SAI_LocalizationDomain::Import);
+	doTranslation(&image, SAI_LocalizationDomain::Option);
+	doTranslation(&image, SAI_LocalizationDomain::Errdlg);
+	if (!target_language)
 	{
-		Dir = L".";
-		my_printf("# Main.txt\n"); printLang(&image, 0x140266C80);
-		my_printf("# MainTip.txt\n"); printLang(&image, 0x14026E020);
-		my_printf("# Import.txt\n"); printLang(&image, 0x140284A10);
-		my_printf("# Option.txt\n"); printLang(&image, 0x1402869C0);
-		my_printf("# Errdlg.txt\n"); printLang(&image, 0x14028FEB0);
+		return 0;
 	}
-	else
-	{
-		wcscpy_s(FilePath, MAX_PATH, Dir); wcscat_s(FilePath, MAX_PATH, L"\\lang\\Main.txt");
-		loadLangFile(&image, FilePath, 0x14025E770);
-		wcscpy_s(FilePath, MAX_PATH, Dir); wcscat_s(FilePath, MAX_PATH, L"\\lang\\MainTip.txt");
-		loadLangFile(&image, FilePath, 0x140265B10);
-		wcscpy_s(FilePath, MAX_PATH, Dir); wcscat_s(FilePath, MAX_PATH, L"\\lang\\Import.txt");
-		loadLangFile(&image, FilePath, 0x140284840);
-		wcscpy_s(FilePath, MAX_PATH, Dir); wcscat_s(FilePath, MAX_PATH, L"\\lang\\Option.txt");
-		loadLangFile(&image, FilePath, 0x140285FA0);
-		wcscpy_s(FilePath, MAX_PATH, Dir); wcscat_s(FilePath, MAX_PATH, L"\\lang\\Errdlg.txt");
-		loadLangFile(&image, FilePath, 0x14028FB30);
-		doQueue(&image);
-	}
-
-
-	wcscpy_s(FilePath, MAX_PATH, Dir); wcscat_s(FilePath, MAX_PATH, L"\\sai2.exe");
+	doQueue(&image);
+	// 保存到文件
+	wcscpy_s(FilePath, MAX_PATH, target_language); wcscat_s(FilePath, MAX_PATH, L"\\sai2.exe");
 	if (!SavePEFile(&image, FilePath))
 	{
 		my_printf("SavePEFile 失败\n");
 		return 1;
 	}
+	
 	ClosePE(&image);
-	return 0;
-
 	my_printf("\nOK.\n");
 	return 0;
 }
