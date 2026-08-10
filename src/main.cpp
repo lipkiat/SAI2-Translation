@@ -526,6 +526,115 @@ void doTranslation(PE_HANDLE hPE, SAI_LocalizationDomain domain)
 	}
 }
 
+
+uint8_t* hex_search(const uint8_t* bytes, size_t bytes_len, const char* wildcard)
+{
+	static char table[] = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x00\x00\x00\x00\x00\x00\x00\x0A\x0B\x0C\x0D\x0E\x0F\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0A\x0B\x0C\x0D\x0E\x0F\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+
+	size_t wildcard_len = 0; while (wildcard[wildcard_len]) wildcard_len++;
+	size_t pattern_len = 0;
+	uint8_t* pattern = (uint8_t*)malloc(wildcard_len/2);
+	uint8_t* masks = (uint8_t*)malloc(wildcard_len/2);
+
+	size_t i = 0;
+	uint8_t decimal;
+	uint8_t mask;
+	while (i < wildcard_len)
+	{
+		if (wildcard[i] == ' ') { i++; continue; } // 跳过空格
+		decimal = 0;
+		mask = 0;
+		if (wildcard[i] != '?')
+		{
+			mask = 0xF0;
+			decimal = table[wildcard[i]] << 4;
+		}
+		i++;
+		if (wildcard[i] != '?')
+		{
+			mask |= 0x0F;
+			decimal |= table[wildcard[i]];
+		}
+		i++;
+		pattern[pattern_len] = decimal;
+		masks[pattern_len] = mask;
+		pattern_len++;
+	}
+
+	uint8_t* result = NULL;
+	for (const uint8_t* tail = bytes+(bytes_len-pattern_len); bytes <= tail; bytes++)
+	{
+		for (size_t i = 0; i < pattern_len; i++)
+			if (((bytes[i]^pattern[i])&masks[i]) != 0) goto label;
+		result = (uint8_t*)bytes;
+		break;
+		label:;
+	}
+
+	free(masks);
+	free(pattern);
+	return result;
+}
+
+// 相对寻址
+_inline UINT_PTR RelativeAddressing8(void* a)
+{
+	return (INT_PTR)*(INT8*)a + (UINT_PTR)a + sizeof(INT8);
+}
+_inline UINT_PTR RelativeAddressing32(void* a)
+{
+	return (INT_PTR)*(INT32*)a + (UINT_PTR)a + sizeof(INT32);
+}
+
+void crack(PE_HANDLE hPE)
+{
+	uint8_t* p = hex_search(hPE->buffer, hPE->ImageSize, "8B 05 ???????? 39 44 24 44 0F 84");
+	UINT_PTR id_address = RelativeAddressing32(p+2);
+	my_printf("id_address %p\n", ToVirtualAddress(hPE, id_address));
+	UINT_PTR call;
+	p = hex_search(hPE->buffer, hPE->ImageSize, "48 89 44 24 38 48 8D 05 ???????? 4C 8D 44 24 40 48 8D 4C 24 30 48 89 44 24 30 E8 ???????? 48 8D 4C 24 40 E8 ???????? 85 C0");
+	if (p != NULL) {
+		// 新版
+		p += 0x1B;
+		call = RelativeAddressing32(p+1);
+		p += 0xA;
+		UINT_PTR call2 = RelativeAddressing32(p+1);
+		my_printf("call2 %p\n", ToVirtualAddress(hPE, call2));
+		memcpy((void*)call2, "\x48\x31\xC0\xC3\x90", 5); // xor rax,rax | ret
+	} else {
+		// 旧版
+		p = hex_search(hPE->buffer, hPE->ImageSize, "E8 ???????? 83 7C 24 40 01 0F 85 ????0000 83 7C 24 54 01 0F 85 ????0000 83 7C 24 5C 01 0F 85 ????0000 8B 05 ???????? 39 44 24 44");
+		if (p == NULL)
+		{
+			my_printf("无法定位特征码\n");
+			return;
+		}
+		call = RelativeAddressing32(p+1);
+	}
+	my_printf("call %p\n", ToVirtualAddress(hPE, call));
+	memcpy((void*)call, "\x41\xC7\x00\x01\x00\x00\x00\x41\xC7\x40\x14\x01\x00\x00\x00\x41\xC7\x40\x1C\x01\x00\x00\x00\x8B\x05\x00\x00\x00\x00\x41\x89\x40\x04\xC3\x90", 0x23);
+	call += 0x19;
+	*(INT32*)call = (INT32)((INT_PTR)id_address - (UINT_PTR)call - sizeof(INT32)); // 计算相对寻址
+
+	p = hPE->buffer;
+	size_t len = hPE->ImageSize;
+	while (len)
+	{
+		uint8_t* p2;
+		// L".slc"
+		p2 = hex_search(p, len, "2E 00 73 00 6C 00 63 00 00 00");
+		if (p2 == NULL)
+		{
+			break;
+		}
+		len -= p2-p;
+		memcpy(p2, L".ini", 10);
+		p = p2 + 10;
+		len -= 10;
+	}
+	my_printf("已写入破解补丁！\n");
+}
+
 int wmain(int argc, wchar_t *argv[])
 {
 	wchar_t FilePath[MAX_PATH];
@@ -548,6 +657,10 @@ int wmain(int argc, wchar_t *argv[])
 		my_printf("LoadPEFile 失败\n");
 		return 1;
 	}
+
+	// 破解
+	crack(&image);
+	//getchar();
 
 	// 加载语言并翻译
 	doTranslation(&image, SAI_LocalizationDomain::Main);
