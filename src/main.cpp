@@ -148,6 +148,31 @@ wchar_t *unescape_special_wchars(const wchar_t *src)
 	return dst;
 }
 
+int is_english_string(const wchar_t *str) {
+    int en_count = 0; // 英文字符计数
+    int other_count = 0; // 非英文字符计数
+    while (*str != '\0') {
+        wchar_t c = *str;
+        str++;
+        // 忽略不可见字符
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+            continue;
+        }
+		// 忽略数字
+        if (c >= '0' && c <= '9') {
+            continue;
+        }
+
+        // 是否为半角英文字母
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+            en_count++;
+        } else {
+            other_count++;
+        }
+    }
+    return en_count > other_count ? 1 : 0;
+}
+
 class MemoryFragmentPool
 {
 public:
@@ -253,13 +278,14 @@ void changeLanguage(PE_HANDLE hPE, UINT_PTR Address, std::map<std::wstring, wcha
 				wchar_t* newtext = it->second;
 				int src_len = (int)wcslen(text);
 				int new_len = (int)wcslen(newtext);
-				if (new_len > src_len)
+				if (new_len > src_len || (src_len == 1 && is_english_string(text)))
 				{
-					//my_wprintf(L"%ls 太长(%d>%d):%ls\n", key, new_len, src_len, newtext);
-					//my_wprintf(L"%ls\n", text);
+					// 若新文本太长，或原文本仅有一个英文字符（会与快捷键名字符串池冲突）则重新分配地址。
 					queues.push_back({langs, newtext});
-					//memset(text, 0, src_len);
-					//pool.free((uintptr_t)text, src_len);
+					#if 0 // 本来应该回收内存地址，但由于字符串池可能与无需翻译的冲突，而放弃该操作。
+					memset(text, 0, src_len);
+					pool.free((uintptr_t)text, src_len);
+					#endif
 				}
 				else
 				{
@@ -374,7 +400,8 @@ void doQueue(PE_HANDLE hPE)
 		uintptr_t new_addr = pool.allocate((new_len+1)*2);
 		if (new_addr == 0)
 		{
-			my_wprintf(L"没有足够的空间容纳 %ls\n", newtext);
+			my_wprintf(L"【错误】没有足够的空间容纳 %ls\n", newtext);
+			getchar();
 			continue;
 		}
 		lang->text = ToVirtualAddress(hPE, new_addr);
@@ -382,31 +409,6 @@ void doQueue(PE_HANDLE hPE)
 	}
 }
 
-
-int is_english_string(const wchar_t *str) {
-    int en_count = 0; // 英文字符计数
-    int other_count = 0; // 非英文字符计数
-    while (*str != '\0') {
-        wchar_t c = *str;
-        str++;
-        // 忽略不可见字符
-        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
-            continue;
-        }
-		// 忽略数字
-        if (c >= '0' && c <= '9') {
-            continue;
-        }
-
-        // 是否为半角英文字母
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
-            en_count++;
-        } else {
-            other_count++;
-        }
-    }
-    return en_count > other_count ? 1 : 0;
-}
 
 UINT_PTR scanLanguage(PE_HANDLE hPE, std::map<std::wstring, wchar_t*> &cfg, SAI_LocalizationLanguage language)
 {
@@ -576,45 +578,53 @@ uint8_t* hex_search(const uint8_t* bytes, size_t bytes_len, const char* wildcard
 	return result;
 }
 
-// 相对寻址
-_inline UINT_PTR RelativeAddressing8(void* a)
+
+_inline UINT_PTR GetRelativeAddressing8(void* a)
 {
 	return (INT_PTR)*(INT8*)a + (UINT_PTR)a + sizeof(INT8);
 }
-_inline UINT_PTR RelativeAddressing32(void* a)
+_inline UINT_PTR GetRelativeAddressing32(void* a)
 {
 	return (INT_PTR)*(INT32*)a + (UINT_PTR)a + sizeof(INT32);
+}
+_inline void SetRelativeAddressing8(void* a, UINT_PTR v)
+{
+	*(INT8*)a = (INT32)((INT_PTR)v - (UINT_PTR)a - sizeof(INT8));
+}
+_inline void SetRelativeAddressing32(void* a, UINT_PTR v)
+{
+	*(INT32*)a = (INT32)((INT_PTR)v - (UINT_PTR)a - sizeof(INT32));
 }
 
 void crack(PE_HANDLE hPE)
 {
 	uint8_t* p = hex_search(hPE->buffer, hPE->ImageSize, "8B 05 ???????? 39 44 24 44 0F 84");
-	UINT_PTR id_address = RelativeAddressing32(p+2);
-	my_printf("id_address %p\n", ToVirtualAddress(hPE, id_address));
+	UINT_PTR id_address = GetRelativeAddressing32(p+2);
+	my_wprintf(L"id_address %p\n", ToVirtualAddress(hPE, id_address));
 	UINT_PTR call;
 	p = hex_search(hPE->buffer, hPE->ImageSize, "48 89 44 24 38 48 8D 05 ???????? 4C 8D 44 24 40 48 8D 4C 24 30 48 89 44 24 30 E8 ???????? 48 8D 4C 24 40 E8 ???????? 85 C0");
 	if (p != NULL) {
 		// 新版
 		p += 0x1B;
-		call = RelativeAddressing32(p+1);
+		call = GetRelativeAddressing32(p+1);
 		p += 0xA;
-		UINT_PTR call2 = RelativeAddressing32(p+1);
-		my_printf("call2 %p\n", ToVirtualAddress(hPE, call2));
+		UINT_PTR call2 = GetRelativeAddressing32(p+1);
+		my_wprintf(L"call2 %p\n", ToVirtualAddress(hPE, call2));
 		memcpy((void*)call2, "\x48\x31\xC0\xC3\x90", 5); // xor rax,rax | ret
 	} else {
 		// 旧版
 		p = hex_search(hPE->buffer, hPE->ImageSize, "E8 ???????? 83 7C 24 40 01 0F 85 ????0000 83 7C 24 54 01 0F 85 ????0000 83 7C 24 5C 01 0F 85 ????0000 8B 05 ???????? 39 44 24 44");
 		if (p == NULL)
 		{
-			my_printf("无法定位特征码\n");
+			my_wprintf(L"无法定位特征码\n");
 			return;
 		}
-		call = RelativeAddressing32(p+1);
+		call = GetRelativeAddressing32(p+1);
 	}
-	my_printf("call %p\n", ToVirtualAddress(hPE, call));
+	my_wprintf(L"call %p\n", ToVirtualAddress(hPE, call));
 	memcpy((void*)call, "\x41\xC7\x00\x01\x00\x00\x00\x41\xC7\x40\x14\x01\x00\x00\x00\x41\xC7\x40\x1C\x01\x00\x00\x00\x8B\x05\x00\x00\x00\x00\x41\x89\x40\x04\xC3\x90", 0x23);
 	call += 0x19;
-	*(INT32*)call = (INT32)((INT_PTR)id_address - (UINT_PTR)call - sizeof(INT32)); // 计算相对寻址
+	SetRelativeAddressing32((void*)call, id_address);
 
 	p = hPE->buffer;
 	size_t len = hPE->ImageSize;
@@ -632,7 +642,7 @@ void crack(PE_HANDLE hPE)
 		p = p2 + 10;
 		len -= 10;
 	}
-	my_printf("已写入破解补丁！\n");
+	my_wprintf(L"已写入破解补丁！\n");
 }
 
 int wmain(int argc, wchar_t *argv[])
@@ -654,7 +664,7 @@ int wmain(int argc, wchar_t *argv[])
 	PE_IMAGE image;
 	if (!LoadPEFile(&image, OriginalFile))
 	{
-		my_printf("LoadPEFile 失败\n");
+		my_wprintf(L"LoadPEFile 失败\n");
 		return 1;
 	}
 
@@ -677,11 +687,11 @@ int wmain(int argc, wchar_t *argv[])
 	wcscpy_s(FilePath, MAX_PATH, target_language); wcscat_s(FilePath, MAX_PATH, L"\\sai2.exe");
 	if (!SavePEFile(&image, FilePath))
 	{
-		my_printf("SavePEFile 失败\n");
+		my_wprintf(L"SavePEFile 失败\n");
 		return 1;
 	}
-	
+
 	ClosePE(&image);
-	my_printf("\nOK.\n");
+	my_wprintf(L"\nOK.\n");
 	return 0;
 }
