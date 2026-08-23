@@ -314,9 +314,12 @@ void changeLanguage(PE_HANDLE hPE, UINT_PTR Address, std::map<std::wstring, wcha
 	}
 }
 
-wchar_t *target_language;
+const wchar_t *g_SourceLanguage = NULL;
+const wchar_t *g_DestinationLanguage = NULL;
+const wchar_t *g_OriginalFile = NULL;
+const wchar_t *g_OutputDirectory = NULL;
 
-void getLangFilePath(wchar_t* buffer, SAI_LocalizationDomain domain, wchar_t* language)
+void getLangFilePath(wchar_t* buffer, SAI_LocalizationDomain domain, const wchar_t* language)
 {
 	wchar_t* file_name = NULL;
 	wcscpy_s(buffer, MAX_PATH, language);
@@ -412,7 +415,9 @@ void doQueue(PE_HANDLE hPE)
 
 UINT_PTR scanLanguage(PE_HANDLE hPE, std::map<std::wstring, wchar_t*> &cfg, SAI_LocalizationLanguage language)
 {
+#if DEBUG
 	my_wprintf(L"正在尝试特征定位...\n");
+#endif
 	BYTE* pEnd = hPE->buffer + hPE->ImageSize;
 	pEnd -= sizeof(SAI_LocalizationEntry);
 	// 为日文
@@ -470,27 +475,33 @@ UINT_PTR scanLanguage(PE_HANDLE hPE, std::map<std::wstring, wchar_t*> &cfg, SAI_
 				best_success_count = success_count;
 				best_other_count = other_count;
 				best_entry = (SAI_LocalizationEntry*)p;
+#if DEBUG
 				my_wprintf(L"找到日文地址 %p\n", (void*)ToVirtualAddress(hPE, (UINT_PTR)p));
 				my_wprintf(L"  成功数量 %d\n", success_count);
 				my_wprintf(L"  失败数量 %d\n", failure_count);
 				my_wprintf(L"  英文数量 %d\n", en_count);
 				my_wprintf(L"  其它数量 %d\n", other_count);
+#endif
 			}
 			if (en_count > other_count && success_count > best_success_count2 && en_count > best_en_count)
 			{
 				best_success_count2 = success_count;
 				best_en_count = en_count;
 				best_entry2 = (SAI_LocalizationEntry*)p;
+#if DEBUG
 				my_wprintf(L"找到英文地址 %p\n", (void*)ToVirtualAddress(hPE, (UINT_PTR)p));
 				my_wprintf(L"  成功数量 %d\n", success_count);
 				my_wprintf(L"  失败数量 %d\n", failure_count);
 				my_wprintf(L"  英文数量 %d\n", en_count);
 				my_wprintf(L"  其它数量 %d\n", other_count);
+#endif
 			}
 		}
 	}
+#if DEBUG
 	my_wprintf(L"最佳日文地址 %p\n", (void*)ToVirtualAddress(hPE, (UINT_PTR)best_entry));
 	my_wprintf(L"最佳英文地址 %p\n", (void*)ToVirtualAddress(hPE, (UINT_PTR)best_entry2));
+#endif
 	switch (language)
 	{
 		case SAI_LocalizationLanguage::Japanese:
@@ -506,24 +517,25 @@ void doTranslation(PE_HANDLE hPE, SAI_LocalizationDomain domain)
 	wchar_t FilePath[MAX_PATH];
 	std::map<std::wstring, wchar_t*> cfg;
 	my_wprintf(L"\n");
-	// 日语（原始语言）
-	getLangFilePath(FilePath, domain, L"ja");
+	// 原始语言
+	getLangFilePath(FilePath, domain, g_SourceLanguage);
 	my_wprintf(L"原始语言文件：%ls\n", FilePath);
 	loadLangFile(FilePath, cfg);
-	UINT_PTR Address = scanLanguage(hPE, cfg, SAI_LocalizationLanguage::Japanese);
-	if (target_language)
+	SAI_LocalizationLanguage language = (wcscmp(g_SourceLanguage, L"ja") == 0) ? (SAI_LocalizationLanguage::Japanese) : (SAI_LocalizationLanguage::English);
+	UINT_PTR Address = scanLanguage(hPE, cfg, language);
+	if (g_DestinationLanguage)
 	{
 		// 目标语言
-		getLangFilePath(FilePath, domain, target_language);
-		my_wprintf(L"目标语言文件：%ls\n", FilePath);
+		getLangFilePath(FilePath, domain, g_DestinationLanguage);
+		my_wprintf(L"翻译语言文件：%ls\n", FilePath);
 		loadLangFile(FilePath, cfg);
 		changeLanguage(hPE, Address, cfg);
 	}
 	else
 	{
 		// 进入打印模式
-		getLangFilePath(FilePath, domain, L".");
-		my_wprintf(L"文件：%ls\n", FilePath);
+		getLangFilePath(FilePath, domain, g_OutputDirectory);
+		my_wprintf(L"输出文件：%ls\n", FilePath);
 		printLang(hPE, Address, FilePath);
 	}
 }
@@ -596,7 +608,7 @@ _inline void SetRelativeAddressing32(void* a, UINT_PTR v)
 	*(INT32*)a = (INT32)((INT_PTR)v - (UINT_PTR)a - sizeof(INT32));
 }
 
-void crack(PE_HANDLE hPE)
+void doCrack(PE_HANDLE hPE)
 {
 	uint8_t* p = hex_search(hPE->buffer, hPE->ImageSize, "8B 05 ???????? 39 44 24 44 0F 84");
 	UINT_PTR id_address = GetRelativeAddressing32(p+2);
@@ -647,30 +659,88 @@ void crack(PE_HANDLE hPE)
 
 int wmain(int argc, wchar_t *argv[])
 {
-	wchar_t FilePath[MAX_PATH];
-	wchar_t *OriginalFile = NULL;
-	if (argc > 1)
+	/* 命令行
+/SourceLanguage			源语言。
+/DestinationLanguage	目标语言的目录名，也用于保存修改。
+/OriginalFile			原始“sai2.exe”的可执行文件。
+/OutputDirectory		输出源语言到指定目录。
+	*/
+	int crack = 0;
+	// 从第1个参数开始遍历（argv[0]是程序名）
+	for (int i = 1; i < argc; i++)
 	{
-		OriginalFile = argv[1];
+		const wchar_t *opt = argv[i];
+		if (opt[0] == '-' || opt[0] == '/')
+		{
+			opt++;
+			do {
+				if (wcscmp(opt, L"crack") == 0) {
+					crack = 1;
+					break;
+				}
+				else if (wcscmp(opt, L"SourceLanguage") == 0) {
+					if (++i < argc) {
+						g_SourceLanguage = argv[i];
+						break;
+					}
+				}
+				else if (wcscmp(opt, L"DestinationLanguage") == 0) {
+					if (++i < argc) {
+						g_DestinationLanguage = argv[i];
+						break;
+					}
+				}
+				else if (wcscmp(opt, L"OriginalFile") == 0) {
+					if (++i < argc) {
+						g_OriginalFile = argv[i];
+						break;
+					}
+				}
+				else if (wcscmp(opt, L"OutputDirectory") == 0) {
+					if (++i < argc) {
+						g_OutputDirectory = argv[i];
+						break;
+					}
+				}
+				else {
+					my_wprintf(L"错误：未知选项 %ls\n", opt);
+					return 1;
+				}
+				my_wprintf(L"错误：选项 %ls 的后面必须跟参数\n", opt);
+				return 1;
+			} while(0);
+		}
+		else {
+			my_wprintf(L"错误：无效参数 %ls\n", opt);
+			return 1;
+		}
 	}
-	if (argc > 2)
+	if (!g_OriginalFile)
 	{
-		target_language = argv[2];
-		my_wprintf(L"原始文件：%ls\n", OriginalFile);
-		my_wprintf(L"目标语言：%ls\n", target_language);
+		my_wprintf(L"错误：未指定可执行文件\n");
+		return 2;
 	}
+	if (!g_SourceLanguage)
+	{
+		my_wprintf(L"错误：未指定源语言\n");
+		return 2;
+	}
+	my_wprintf(L"原始文件：%ls\n", g_OriginalFile);
+	my_wprintf(L"原始语言：%ls\n", g_SourceLanguage);
 
 	// 加载PE文件
 	PE_IMAGE image;
-	if (!LoadPEFile(&image, OriginalFile))
+	if (!LoadPEFile(&image, g_OriginalFile))
 	{
 		my_wprintf(L"LoadPEFile 失败\n");
 		return 1;
 	}
 
 	// 破解
-	crack(&image);
-	//getchar();
+	if (crack)
+	{
+		doCrack(&image);
+	}
 
 	// 加载语言并翻译
 	doTranslation(&image, SAI_LocalizationDomain::Main);
@@ -678,20 +748,18 @@ int wmain(int argc, wchar_t *argv[])
 	doTranslation(&image, SAI_LocalizationDomain::Import);
 	doTranslation(&image, SAI_LocalizationDomain::Option);
 	doTranslation(&image, SAI_LocalizationDomain::Errdlg);
-	if (!target_language)
-	{
-		return 0;
-	}
 	doQueue(&image);
-	// 保存到文件
-	wcscpy_s(FilePath, MAX_PATH, target_language); wcscat_s(FilePath, MAX_PATH, L"\\sai2.exe");
-	if (!SavePEFile(&image, FilePath))
+	if (g_DestinationLanguage)
 	{
-		my_wprintf(L"SavePEFile 失败\n");
-		return 1;
+		// 保存到文件
+		wchar_t file_path[MAX_PATH];
+		wcscpy_s(file_path, MAX_PATH, g_DestinationLanguage); wcscat_s(file_path, MAX_PATH, L"\\sai2.exe");
+		if (!SavePEFile(&image, file_path))
+		{
+			my_wprintf(L"SavePEFile 失败\n");
+		}
 	}
-
 	ClosePE(&image);
-	my_wprintf(L"\nOK.\n");
+	my_wprintf(L"\nDone.\n");
 	return 0;
 }
