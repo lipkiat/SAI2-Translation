@@ -2,7 +2,7 @@
 chcp 65001
 
 set "SEVENZIP_PATH=C:\Program Files\7-Zip\7z.exe"
-set "PREFIX=sai2-Alpha-20260823-64bit-"
+set "PREFIX=sai2-Alpha-20260902-64bit-"
 
 :: zh-CN
 copy /Y ".\en\init\blotmap\Blots.bmp" ".\zh-CN\init\blotmap\晕染.bmp"
@@ -40,7 +40,7 @@ pause
 exit
 
 :Pack
-".\patcher.exe" /crack /OriginalFile ".\sai2.exe.bak" /SourceLanguage "ja" /DestinationLanguage ".\%~1"
+".\patcher.exe" /crack /OriginalFile ".\sai2.exe.bak" /OutputFile ".\%~1\sai2.exe" /SourceLanguage "ja" /DestinationLanguage ".\%~1"
 set "SOURCE_PATH=".\%~1\init\" ".\%~1\sai2.exe" ".\%~1\sai2.ini" ".\%~1\history.txt""
 set "OUTPUT_ARCHIVE=%~dp0%PREFIX%%~1.zip"
 "%SEVENZIP_PATH%" a -tzip "%OUTPUT_ARCHIVE%" %SOURCE_PATH%
