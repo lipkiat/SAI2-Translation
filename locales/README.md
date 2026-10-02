@@ -1,3 +1,5 @@
+# 当前主要维护简体中文的版本，而繁体中文台湾方言是我们使用 OpenCC 直接转换的
+
 ## Official version
 - Japanese: https://www.systemax.jp/ja/sai/devdept.html
 - English: https://www.systemax.jp/en/sai/devdept.html

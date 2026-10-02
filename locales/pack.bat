@@ -2,7 +2,7 @@
 chcp 65001
 
 set "SEVENZIP_PATH=C:\Program Files\7-Zip\7z.exe"
-set "PREFIX=sai2-Alpha-20260902-64bit-"
+set "PREFIX=sai2-Alpha-20260925-64bit-"
 
 :: zh-CN
 copy /Y ".\en\init\blotmap\Blots.bmp" ".\zh-CN\init\blotmap\晕染.bmp"

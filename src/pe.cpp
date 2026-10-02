@@ -1,170 +1,240 @@
-﻿#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <malloc.h>
-#include <memory.h>
+﻿#include "pe.h"
 
-#include "pe.h"
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <memory>
 
-static void* LoadFileData(const wchar_t* path, size_t* size)
+namespace
 {
-	void* data = NULL;
-	LARGE_INTEGER fileSize;
-	DWORD bytesRead;
-	size_t remainingSize;
-	char* ptr;
-	const size_t chunkSize = 2147483648; // 2GB
-	DWORD currentChunkSize;
-	// 打开文件
-	HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN | FILE_ATTRIBUTE_NORMAL, NULL);
-	if (hFile == INVALID_HANDLE_VALUE) {
+class FileHandle
+{
+  public:
+    explicit FileHandle(HANDLE value) : value_(value)
+    {
+    }
+    ~FileHandle()
+    {
+        if (value_ != INVALID_HANDLE_VALUE)
+            CloseHandle(value_);
+    }
+    FileHandle(const FileHandle &) = delete;
+    FileHandle &operator=(const FileHandle &) = delete;
+    HANDLE get() const
+    {
+        return value_;
+    }
+
+  private:
+    HANDLE value_;
+};
+
+using ByteBuffer = std::unique_ptr<BYTE, decltype(&std::free)>;
+
+bool Contains(size_t total, size_t offset, size_t length)
+{
+    return offset <= total && length <= total - offset;
+}
+
+const IMAGE_NT_HEADERS *GetHeaders(const BYTE *data, size_t size)
+{
+    if (!data || size < sizeof(IMAGE_DOS_HEADER))
+        return nullptr;
+    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(data);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0)
+        return nullptr;
+    const size_t offset = static_cast<size_t>(dos->e_lfanew);
+    if (!Contains(size, offset, sizeof(IMAGE_NT_HEADERS)))
+        return nullptr;
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(data + offset);
+#ifdef _WIN64
+    constexpr WORD machine = IMAGE_FILE_MACHINE_AMD64;
+#else
+    constexpr WORD machine = IMAGE_FILE_MACHINE_I386;
+#endif
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != machine ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC ||
+        nt->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER))
+        return nullptr;
+    const size_t sectionOffset =
+        offset + FIELD_OFFSET(IMAGE_NT_HEADERS, OptionalHeader) + nt->FileHeader.SizeOfOptionalHeader;
+    const size_t sectionSize =
+        static_cast<size_t>(nt->FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+    if (!Contains(size, sectionOffset, sectionSize) ||
+        !Contains(nt->OptionalHeader.SizeOfHeaders, sectionOffset, sectionSize) ||
+        nt->OptionalHeader.SizeOfHeaders > size ||
+        nt->OptionalHeader.SizeOfHeaders > nt->OptionalHeader.SizeOfImage)
+        return nullptr;
+    return nt;
+}
+
+ByteBuffer ReadFileData(const wchar_t *path, size_t &size)
+{
+    size = 0;
+    FileHandle file(CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                FILE_FLAG_SEQUENTIAL_SCAN | FILE_ATTRIBUTE_NORMAL, nullptr));
+    LARGE_INTEGER length{};
+    if (file.get() == INVALID_HANDLE_VALUE || !GetFileSizeEx(file.get(), &length) || length.QuadPart <= 0 ||
+        static_cast<unsigned long long>(length.QuadPart) > (std::numeric_limits<size_t>::max)())
+        return ByteBuffer(nullptr, &std::free);
+    const size_t fileSize = static_cast<size_t>(length.QuadPart);
+    ByteBuffer data(static_cast<BYTE *>(std::malloc(fileSize)), &std::free);
+    if (!data)
+        return data;
+    size_t offset = 0;
+    while (offset < fileSize)
+    {
+        const DWORD chunk = static_cast<DWORD>((std::min)(fileSize - offset, size_t{1} << 30));
+        DWORD read = 0;
+        if (!ReadFile(file.get(), data.get() + offset, chunk, &read, nullptr) || read == 0)
+            return ByteBuffer(nullptr, &std::free);
+        offset += read;
+    }
+    size = fileSize;
+    return data;
+}
+
+bool WriteFileData(const wchar_t *path, const BYTE *data, size_t size)
+{
+    FileHandle file(
+        CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (file.get() == INVALID_HANDLE_VALUE)
+        return false;
+    size_t offset = 0;
+    while (offset < size)
+    {
+        const DWORD chunk = static_cast<DWORD>((std::min)(size - offset, size_t{1} << 30));
+        DWORD written = 0;
+        if (!WriteFile(file.get(), data + offset, chunk, &written, nullptr) || written == 0)
+            return false;
+        offset += written;
+    }
+    return true;
+}
+} // namespace
+
+PE_IMAGE::~PE_IMAGE()
+{
+    ClosePE(this);
+}
+
+BOOL LoadPE(PE_HANDLE image, const BYTE *data, size_t size)
+{
+    if (!image)
+        return FALSE;
+    const auto *nt = GetHeaders(data, size);
+    if (!nt)
+        return FALSE;
+    const auto *sections = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+    {
+        const auto &section = sections[i];
+        if (!Contains(nt->OptionalHeader.SizeOfImage, section.VirtualAddress,
+                      (std::max)(section.Misc.VirtualSize, section.SizeOfRawData)) ||
+            (section.SizeOfRawData && !Contains(size, section.PointerToRawData, section.SizeOfRawData)))
+            return FALSE;
+    }
+    auto *buffer = static_cast<BYTE *>(
+        VirtualAlloc(nullptr, nt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!buffer)
+        return FALSE;
+    std::memcpy(buffer, data, nt->OptionalHeader.SizeOfHeaders);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+        if (sections[i].SizeOfRawData)
+            std::memcpy(buffer + sections[i].VirtualAddress, data + sections[i].PointerToRawData,
+                        sections[i].SizeOfRawData);
+    const DWORD imageSize = nt->OptionalHeader.SizeOfImage;
+    const UINT_PTR imageBase = static_cast<UINT_PTR>(nt->OptionalHeader.ImageBase);
+    ClosePE(image);
+    image->buffer = buffer;
+    image->ImageSize = imageSize;
+    image->ImageBase = imageBase;
+    return TRUE;
+}
+
+BYTE *SavePE(PE_HANDLE image, size_t *size)
+{
+    if (!size)
+        return nullptr;
+    *size = 0;
+    if (!image)
+        return nullptr;
+    const auto *nt = GetHeaders(image->buffer, image->ImageSize);
+    if (!nt)
+        return nullptr;
+    const auto *sections = IMAGE_FIRST_SECTION(nt);
+    size_t fileSize = nt->OptionalHeader.SizeOfHeaders;
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+    {
+        const auto &section = sections[i];
+        if (!Contains(image->ImageSize, section.VirtualAddress, section.SizeOfRawData) ||
+            !Contains(MAXDWORD, section.PointerToRawData, section.SizeOfRawData))
+            return nullptr;
+        fileSize =
+            (std::max)(fileSize, static_cast<size_t>(section.PointerToRawData) + section.SizeOfRawData);
+    }
+    auto *data = static_cast<BYTE *>(std::calloc(fileSize, 1));
+    if (!data)
+        return nullptr;
+    std::memcpy(data, image->buffer, nt->OptionalHeader.SizeOfHeaders);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+        if (sections[i].SizeOfRawData)
+            std::memcpy(data + sections[i].PointerToRawData, image->buffer + sections[i].VirtualAddress,
+                        sections[i].SizeOfRawData);
+    // The certificate overlay is not retained when rebuilding the executable.
+    auto *outputNt = reinterpret_cast<IMAGE_NT_HEADERS *>(
+        data + reinterpret_cast<const IMAGE_DOS_HEADER *>(data)->e_lfanew);
+    outputNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY] = {};
+    *size = fileSize;
+    return data;
+}
+
+void ClosePE(PE_HANDLE image)
+{
+    if (!image)
+        return;
+    if (image->buffer)
+        VirtualFree(image->buffer, 0, MEM_RELEASE);
+    image->buffer = nullptr;
+    image->ImageSize = 0;
+    image->ImageBase = 0;
+}
+
+BOOL LoadPEFile(PE_HANDLE image, const wchar_t *path)
+{
+    if (!image || !path)
+        return FALSE;
+    size_t size = 0;
+    auto data = ReadFileData(path, size);
+    return data && LoadPE(image, data.get(), size);
+}
+
+BOOL SavePEFile(PE_HANDLE image, const wchar_t *path)
+{
+    if (!image || !path)
+        return FALSE;
+    size_t size = 0;
+    ByteBuffer data(SavePE(image, &size), &std::free);
+    return data && WriteFileData(path, data.get(), size);
+}
+
+UINT_PTR ToBufferAddress(PE_HANDLE hPE, UINT_PTR Address)
+{
+	Address -= hPE->ImageBase;
+	if (Address > hPE->ImageSize)
+	{
 		return NULL;
 	}
-	do {
-		// 获取文件大小
-		if (!GetFileSizeEx(hFile, &fileSize)) {
-			break;
-		}
-		remainingSize = (size_t)fileSize.QuadPart;
-		*size = remainingSize;
-		// 分配内存
-		data = malloc(remainingSize);
-		if (!data) {
-			break;
-		}
-		// 分块读取文件，支持大于 4GB 的文件
-		ptr = (char*)data;
-		while (remainingSize > 0) {
-			currentChunkSize = (DWORD)min(chunkSize, remainingSize);
-			if (!ReadFile(hFile, ptr, currentChunkSize, &bytesRead, NULL)) {
-				free(data);
-				data = NULL;
-				break;
-			}
-			ptr += bytesRead;
-			remainingSize -= bytesRead;
-		}
-	} while(false);
-	// 关闭文件
-	CloseHandle(hFile);
-	return data;
+	return Address + (UINT_PTR)hPE->buffer;
 }
 
-static BOOL SaveFileData(const wchar_t* path, void* data, size_t size)
+UINT_PTR ToVirtualAddress(PE_HANDLE hPE, UINT_PTR Address)
 {
-	DWORD bytesWritten;
-	HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-	if (h == INVALID_HANDLE_VALUE)
+	Address -= (UINT_PTR)hPE->buffer;
+	if (Address > hPE->ImageSize)
 	{
-		return FALSE;
+		return NULL;
 	}
-	BOOL isOK = WriteFile(h, data, (DWORD)size, &bytesWritten, NULL);
-	CloseHandle(h);
-	return isOK;
-}
-
-
-
-BOOL LoadPE(PE_HANDLE hPE, BYTE* fileData, size_t fileSize)
-{
-	PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)fileData;
-	if (IMAGE_DOS_SIGNATURE != dos->e_magic) return FALSE;
-	PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)fileData + dos->e_lfanew);
-	if (IMAGE_NT_SIGNATURE != nt->Signature) return FALSE;
-#ifdef _WIN64
-	if (IMAGE_FILE_MACHINE_AMD64 != nt->FileHeader.Machine) return FALSE;
-#else
-	if (IMAGE_FILE_MACHINE_I386 != nt->FileHeader.Machine) return FALSE;
-#endif
-
-	hPE->ImageSize = nt->OptionalHeader.SizeOfImage;
-	hPE->buffer = (BYTE*)VirtualAlloc(NULL, hPE->ImageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-	if (hPE->buffer == NULL)
-	{
-		return FALSE;
-	}
-	//memset(hPE->buffer, 0, hPE->ImageSize);
-
-	// Header
-	memcpy(hPE->buffer, fileData, nt->OptionalHeader.SizeOfHeaders);
-
-	// Section
-	IMAGE_SECTION_HEADER* sections = (IMAGE_SECTION_HEADER*)((UINT_PTR)nt + FIELD_OFFSET(IMAGE_NT_HEADERS, OptionalHeader) + nt->FileHeader.SizeOfOptionalHeader);
-	WORD sectionNumber = nt->FileHeader.NumberOfSections;
-	for (WORD i = 0; i < sectionNumber; i++)
-	{
-		memcpy(hPE->buffer + sections[i].VirtualAddress, fileData + sections[i].PointerToRawData, sections[i].SizeOfRawData);
-	}
-
-	hPE->ImageBase = nt->OptionalHeader.ImageBase;
-	return TRUE;
-}
-
-BYTE* SavePE(PE_HANDLE hPE, size_t* size)
-{
-	PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hPE->buffer;
-	PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)hPE->buffer + dos->e_lfanew);
-	dos->e_magic = IMAGE_DOS_SIGNATURE;
-	nt->Signature = IMAGE_NT_SIGNATURE;
-	PIMAGE_DATA_DIRECTORY pDir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY];
-	pDir->VirtualAddress = 0;
-	pDir->Size = 0;
-
-	// 计算文件大小
-	DWORD fileSize = nt->OptionalHeader.SizeOfHeaders;
-	WORD nSections = nt->FileHeader.NumberOfSections;
-	IMAGE_SECTION_HEADER *pSec = IMAGE_FIRST_SECTION(nt);
-	for (WORD i = 0; i < nSections; ++i)
-	{
-		DWORD end = pSec[i].PointerToRawData + pSec[i].SizeOfRawData;
-		if (end > fileSize) fileSize = end;
-	}
-	*size = fileSize;
-
-	BYTE* fileBuffer = (BYTE*)malloc(fileSize);
-	if(fileBuffer)
-	{
-		memset(fileBuffer, 0, fileSize);
-
-		// Copy the file header
-		memcpy(fileBuffer, hPE->buffer, nt->OptionalHeader.SizeOfHeaders);
-
-		// Copy each section back
-		for (WORD i = 0; i < nSections; ++i, ++pSec)
-		{
-			memcpy(fileBuffer + pSec->PointerToRawData, hPE->buffer + pSec->VirtualAddress, pSec->SizeOfRawData);
-		}
-	}
-	return fileBuffer;
-}
-
-void ClosePE(PE_HANDLE hPE)
-{
-	VirtualFree(hPE->buffer, 0, MEM_RELEASE);
-	hPE->buffer = NULL;
-}
-
-BOOL LoadPEFile(PE_HANDLE hPE, const wchar_t* fileName)
-{
-	size_t fileSize;
-	BYTE* fileData = (BYTE*)LoadFileData(fileName, &fileSize);
-	if (!fileData)
-	{
-		return FALSE;
-	}
-	BOOL isOK = LoadPE(hPE, fileData, fileSize);
-	free(fileData);
-	return isOK;
-}
-
-BOOL SavePEFile(PE_HANDLE hPE, const wchar_t* fileName)
-{
-	size_t fileSize;
-	BYTE* fileData = SavePE(hPE, &fileSize);
-	if (!fileData)
-	{
-		return FALSE;
-	}
-	BOOL isOK = SaveFileData(fileName, fileData, fileSize);
-	free(fileData);
-	return isOK;
+	return Address + hPE->ImageBase;
 }
