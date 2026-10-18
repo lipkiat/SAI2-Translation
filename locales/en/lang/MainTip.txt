@@ -229,6 +229,7 @@ TxCtl_Subscript=Specify subscript.
 TxCtl_Italic=Select italic style.
 TxCtl_RubyGap=Specify to always reserve line gaps for ruby height.
 TxCtl_RubyInto=Specify to move caret into the ruby text with the arrow keys without modifier keys.
+TxCtl_SelectTopmost=Specify the behavior when clicking or dragging on text.\nON... Select the topmost text at the mouse cursor position.\nOFF... Always select text on the current layer.
 CvnewCtl_CnfPreset=Configure canvas presets.
 CvnewCtl_AddPreset=Register the current metrics into canvas presets.
 Cvpscfg_AddNew=Create a new preset and insert it to the selected position.

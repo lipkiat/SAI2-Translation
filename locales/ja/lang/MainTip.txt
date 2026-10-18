@@ -229,6 +229,7 @@ TxCtl_Subscript=下付きを指定します。
 TxCtl_Italic=イタリック体を選択します。
 TxCtl_RubyGap=すべての行で常にルビのための隙間を空けるかどうかを指定します。
 TxCtl_RubyInto=修飾キーなしでルビにカレットを移動するかどうかを指定します。
+TxCtl_SelectTopmost=テキスト上でクリック・ドラッグした場合の動作を指定します。\nON … マウスカーソル位置にある最上位のテキストを選択対象にする\nOFF … 常にカレントレイヤーのテキストを選択対象にする
 CvnewCtl_CnfPreset=規定サイズを編集します。
 CvnewCtl_AddPreset=現在のサイズ情報を規定サイズとして登録します。
 Cvpscfg_AddNew=選択位置に新しい規定サイズを作成して挿入します。
