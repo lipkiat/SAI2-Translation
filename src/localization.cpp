@@ -1,56 +1,23 @@
-﻿#include "localization.h"
-#include "common.h"
-
-#include <cstring>
+﻿#include <cstring>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <string>
 #include <vector>
 
+#include "localization.h"
+#include "common.h"
+
 namespace
 {
 struct LocalizationEntry
 {
-    UINT_PTR name;
-    UINT_PTR text;
+    uintptr_t name;
+    uintptr_t text;
     size_t id;
 };
 
 using Translations = std::map<std::wstring, std::wstring>;
-
-// Files use UTF-8; Windows wchar_t and the executable's strings use UTF-16.
-// Strict conversion prevents invalid input from silently becoming replacement characters.
-bool DecodeUtf8(const std::string &bytes, std::wstring &text)
-{
-    text.clear();
-    if (bytes.empty())
-        return true;
-    if (bytes.size() > static_cast<size_t>((std::numeric_limits<int>::max)()))
-        return false;
-    const int size = static_cast<int>(bytes.size());
-    const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(), size, nullptr, 0);
-    if (length == 0)
-        return false;
-    text.resize(length);
-    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(), size, &text[0], length) == length;
-}
-
-bool EncodeUtf8(const std::wstring &text, std::string &bytes)
-{
-    bytes.clear();
-    if (text.empty())
-        return true;
-    if (text.size() > static_cast<size_t>((std::numeric_limits<int>::max)()))
-        return false;
-    const int size = static_cast<int>(text.size());
-    const int length =
-        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), size, nullptr, 0, nullptr, nullptr);
-    if (length == 0)
-        return false;
-    bytes.resize(length);
-    return WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), size, &bytes[0], length, nullptr, nullptr) == length;
-}
 
 struct PendingTranslation
 {
@@ -61,11 +28,11 @@ struct PendingTranslation
 class MemoryFragmentPool
 {
 public:
-    void Release(UINT_PTR address, size_t size)
+    void Release(uintptr_t address, size_t size)
     {
         blocks_.emplace(size, address);
     }
-    UINT_PTR Allocate(size_t size)
+    uintptr_t Allocate(size_t size)
     {
         const auto it = blocks_.lower_bound(size);
         if (it == blocks_.end())
@@ -79,18 +46,18 @@ public:
     }
 
 private:
-    std::multimap<size_t, UINT_PTR> blocks_;
+    std::multimap<size_t, uintptr_t> blocks_;
 };
 
 bool Contains(PE_HANDLE image, const void *pointer, size_t size)
 {
-    const auto address = reinterpret_cast<UINT_PTR>(pointer);
-    const auto base = reinterpret_cast<UINT_PTR>(image->buffer);
+    const auto address = reinterpret_cast<uintptr_t>(pointer);
+    const auto base = reinterpret_cast<uintptr_t>(image->buffer);
     return address >= base && address - base <= image->ImageSize &&
            size <= image->ImageSize - (address - base);
 }
 
-wchar_t *GetString(PE_HANDLE image, UINT_PTR address)
+wchar_t *GetString(PE_HANDLE image, uintptr_t address)
 {
     auto *value = reinterpret_cast<wchar_t *>(ToBufferAddress(image, address));
     if (!value || address % alignof(wchar_t) != 0)
@@ -325,7 +292,7 @@ void ReplaceLanguage(PE_HANDLE image, LocalizationEntry *entry, const Translatio
                     if (*remainder)
                     {
                         std::memset(remainder, 0, bytes);
-                        pool.Release(reinterpret_cast<UINT_PTR>(remainder), bytes);
+                        pool.Release(reinterpret_cast<uintptr_t>(remainder), bytes);
                     }
                 }
             }

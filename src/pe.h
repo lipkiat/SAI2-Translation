@@ -1,20 +1,12 @@
 ﻿#pragma once
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <cstddef>
+#include <cstdint>
 
 // Owns an image mapped for editing, never for execution.
 struct PE_IMAGE
 {
-    BYTE *buffer = nullptr;
-    DWORD ImageSize = 0;
-    UINT_PTR ImageBase = 0;
+    uint8_t *buffer = nullptr;
+    uint32_t ImageSize = 0;
+    uintptr_t ImageBase = 0;
 
     PE_IMAGE() = default;
     ~PE_IMAGE();
@@ -23,12 +15,13 @@ struct PE_IMAGE
 };
 using PE_HANDLE = PE_IMAGE *;
 
-BOOL LoadPE(PE_HANDLE image, const BYTE *data, size_t size);
+bool LoadPE(PE_HANDLE image, const uint8_t *data, size_t size);
 // The returned buffer must be released with std::free.
-BYTE *SavePE(PE_HANDLE image, size_t *size);
+uint8_t *SavePE(PE_HANDLE image, size_t *size);
 void ClosePE(PE_HANDLE image);
-BOOL LoadPEFile(PE_HANDLE image, const wchar_t *path);
-BOOL SavePEFile(PE_HANDLE image, const wchar_t *path);
 
-UINT_PTR ToBufferAddress(PE_HANDLE image, UINT_PTR address);
-UINT_PTR ToVirtualAddress(PE_HANDLE image, UINT_PTR address);
+bool LoadPEFile(PE_HANDLE image, const wchar_t *path);
+bool SavePEFile(PE_HANDLE image, const wchar_t *path);
+
+uintptr_t ToBufferAddress(PE_HANDLE image, uintptr_t address);
+uintptr_t ToVirtualAddress(PE_HANDLE image, uintptr_t address);

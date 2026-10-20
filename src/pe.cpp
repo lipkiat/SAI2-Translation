@@ -1,4 +1,5 @@
-﻿#include "pe.h"
+﻿#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -6,38 +7,75 @@
 #include <limits>
 #include <memory>
 
-namespace
+#include "pe.h"
+
+
+static void* LoadFileData(const wchar_t* path, size_t* size)
 {
-class FileHandle
+	HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN | FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (hFile == INVALID_HANDLE_VALUE) {
+		return nullptr;
+	}
+    LARGE_INTEGER fileSize;
+    DWORD bytesRead;
+    size_t remainingSize;
+    void* data = nullptr;
+    char* ptr;
+    const size_t chunkSize = 1 << 31; // 2GB
+    DWORD currentChunkSize;
+	do {
+		if (!GetFileSizeEx(hFile, &fileSize)) {
+			break;
+		}
+		remainingSize = (size_t)fileSize.QuadPart;
+		*size = remainingSize;
+		data = std::malloc(remainingSize);
+		if (!data) {
+			break;
+		}
+		ptr = (char*)data;
+		while (remainingSize > 0) {
+			currentChunkSize = static_cast<DWORD>(min(chunkSize, remainingSize));
+			if (!ReadFile(hFile, ptr, currentChunkSize, &bytesRead, nullptr)) {
+				std::free(data);
+				data = nullptr;
+				break;
+			}
+			ptr += bytesRead;
+			remainingSize -= bytesRead;
+		}
+	} while(false);
+	CloseHandle(hFile);
+	return data;
+}
+
+static bool SaveFileData(const wchar_t* path, void* data, size_t size)
 {
-  public:
-    explicit FileHandle(HANDLE value) : value_(value)
+	HANDLE hFile = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (hFile == INVALID_HANDLE_VALUE)
+        return FALSE;
+	DWORD written;
+    size_t offset = 0;
+    bool r = true;
+    while (offset < size)
     {
+        const DWORD chunk = static_cast<DWORD>(min(size - offset, 1 << 31));
+        r = WriteFile(hFile, static_cast<BYTE*>(data) + offset, chunk, &written, nullptr);
+        if (!r)
+            break;
+        offset += written;
     }
-    ~FileHandle()
-    {
-        if (value_ != INVALID_HANDLE_VALUE)
-            CloseHandle(value_);
-    }
-    FileHandle(const FileHandle &) = delete;
-    FileHandle &operator=(const FileHandle &) = delete;
-    HANDLE get() const
-    {
-        return value_;
-    }
+	CloseHandle(hFile);
+	return r;
+}
 
-  private:
-    HANDLE value_;
-};
 
-using ByteBuffer = std::unique_ptr<BYTE, decltype(&std::free)>;
-
-bool Contains(size_t total, size_t offset, size_t length)
+static bool Contains(size_t total, size_t offset, size_t length)
 {
     return offset <= total && length <= total - offset;
 }
 
-const IMAGE_NT_HEADERS *GetHeaders(const BYTE *data, size_t size)
+static const IMAGE_NT_HEADERS *GetHeaders(const BYTE *data, size_t size)
 {
     if (!data || size < sizeof(IMAGE_DOS_HEADER))
         return nullptr;
@@ -69,60 +107,13 @@ const IMAGE_NT_HEADERS *GetHeaders(const BYTE *data, size_t size)
     return nt;
 }
 
-ByteBuffer ReadFileData(const wchar_t *path, size_t &size)
-{
-    size = 0;
-    FileHandle file(CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                FILE_FLAG_SEQUENTIAL_SCAN | FILE_ATTRIBUTE_NORMAL, nullptr));
-    LARGE_INTEGER length{};
-    if (file.get() == INVALID_HANDLE_VALUE || !GetFileSizeEx(file.get(), &length) || length.QuadPart <= 0 ||
-        static_cast<unsigned long long>(length.QuadPart) > (std::numeric_limits<size_t>::max)())
-        return ByteBuffer(nullptr, &std::free);
-    const size_t fileSize = static_cast<size_t>(length.QuadPart);
-    ByteBuffer data(static_cast<BYTE *>(std::malloc(fileSize)), &std::free);
-    if (!data)
-        return data;
-    size_t offset = 0;
-    while (offset < fileSize)
-    {
-        const DWORD chunk = static_cast<DWORD>((std::min)(fileSize - offset, size_t{1} << 30));
-        DWORD read = 0;
-        if (!ReadFile(file.get(), data.get() + offset, chunk, &read, nullptr) || read == 0)
-            return ByteBuffer(nullptr, &std::free);
-        offset += read;
-    }
-    size = fileSize;
-    return data;
-}
-
-bool WriteFileData(const wchar_t *path, const BYTE *data, size_t size)
-{
-    FileHandle file(
-        CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
-    if (file.get() == INVALID_HANDLE_VALUE)
-        return false;
-    size_t offset = 0;
-    while (offset < size)
-    {
-        const DWORD chunk = static_cast<DWORD>((std::min)(size - offset, size_t{1} << 30));
-        DWORD written = 0;
-        if (!WriteFile(file.get(), data + offset, chunk, &written, nullptr) || written == 0)
-            return false;
-        offset += written;
-    }
-    return true;
-}
-} // namespace
-
 PE_IMAGE::~PE_IMAGE()
 {
     ClosePE(this);
 }
 
-BOOL LoadPE(PE_HANDLE image, const BYTE *data, size_t size)
+bool LoadPE(PE_HANDLE image, const uint8_t *data, size_t size)
 {
-    if (!image)
-        return FALSE;
     const auto *nt = GetHeaders(data, size);
     if (!nt)
         return FALSE;
@@ -153,10 +144,8 @@ BOOL LoadPE(PE_HANDLE image, const BYTE *data, size_t size)
     return TRUE;
 }
 
-BYTE *SavePE(PE_HANDLE image, size_t *size)
+uint8_t *SavePE(PE_HANDLE image, size_t *size)
 {
-    if (!size)
-        return nullptr;
     *size = 0;
     if (!image)
         return nullptr;
@@ -171,8 +160,7 @@ BYTE *SavePE(PE_HANDLE image, size_t *size)
         if (!Contains(image->ImageSize, section.VirtualAddress, section.SizeOfRawData) ||
             !Contains(MAXDWORD, section.PointerToRawData, section.SizeOfRawData))
             return nullptr;
-        fileSize =
-            (std::max)(fileSize, static_cast<size_t>(section.PointerToRawData) + section.SizeOfRawData);
+        fileSize = (std::max)(fileSize, static_cast<size_t>(section.PointerToRawData) + section.SizeOfRawData);
     }
     auto *data = static_cast<BYTE *>(std::calloc(fileSize, 1));
     if (!data)
@@ -192,8 +180,6 @@ BYTE *SavePE(PE_HANDLE image, size_t *size)
 
 void ClosePE(PE_HANDLE image)
 {
-    if (!image)
-        return;
     if (image->buffer)
         VirtualFree(image->buffer, 0, MEM_RELEASE);
     image->buffer = nullptr;
@@ -201,39 +187,43 @@ void ClosePE(PE_HANDLE image)
     image->ImageBase = 0;
 }
 
-BOOL LoadPEFile(PE_HANDLE image, const wchar_t *path)
+bool LoadPEFile(PE_HANDLE image, const wchar_t* path)
 {
-    if (!image || !path)
-        return FALSE;
-    size_t size = 0;
-    auto data = ReadFileData(path, size);
-    return data && LoadPE(image, data.get(), size);
+	size_t fileSize;
+	BYTE* fileData = (BYTE*)LoadFileData(path, &fileSize);
+	if (!fileData) {
+		return FALSE;
+	}
+	BOOL isOK = LoadPE(image, fileData, fileSize);
+	std::free(fileData);
+	return isOK;
 }
 
-BOOL SavePEFile(PE_HANDLE image, const wchar_t *path)
+bool SavePEFile(PE_HANDLE image, const wchar_t* path)
 {
-    if (!image || !path)
-        return FALSE;
-    size_t size = 0;
-    ByteBuffer data(SavePE(image, &size), &std::free);
-    return data && WriteFileData(path, data.get(), size);
+	size_t fileSize;
+	BYTE* fileData = SavePE(image, &fileSize);
+	if (!fileData) {
+		return FALSE;
+	}
+	BOOL isOK = SaveFileData(path, fileData, fileSize);
+	std::free(fileData);
+	return isOK;
 }
 
-UINT_PTR ToBufferAddress(PE_HANDLE hPE, UINT_PTR Address)
+uintptr_t ToBufferAddress(PE_HANDLE hPE, uintptr_t Address)
 {
 	Address -= hPE->ImageBase;
-	if (Address > hPE->ImageSize)
-	{
+	if (Address > hPE->ImageSize) {
 		return NULL;
 	}
-	return Address + (UINT_PTR)hPE->buffer;
+	return Address + (uintptr_t)hPE->buffer;
 }
 
-UINT_PTR ToVirtualAddress(PE_HANDLE hPE, UINT_PTR Address)
+uintptr_t ToVirtualAddress(PE_HANDLE hPE, uintptr_t Address)
 {
-	Address -= (UINT_PTR)hPE->buffer;
-	if (Address > hPE->ImageSize)
-	{
+	Address -= (uintptr_t)hPE->buffer;
+	if (Address > hPE->ImageSize) {
 		return NULL;
 	}
 	return Address + hPE->ImageBase;

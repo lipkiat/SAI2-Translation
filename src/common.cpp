@@ -4,7 +4,42 @@
 #include <cstdarg>
 #include <cstdio>
 #include <vector>
+
 #include "common.h"
+
+// Files use UTF-8; Windows wchar_t and the executable's strings use UTF-16.
+// Strict conversion prevents invalid input from silently becoming replacement characters.
+bool DecodeUtf8(const std::string &bytes, std::wstring &text)
+{
+    text.clear();
+    if (bytes.empty())
+        return true;
+    if (bytes.size() > static_cast<size_t>((std::numeric_limits<int>::max)()))
+        return false;
+    const int size = static_cast<int>(bytes.size());
+    const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(), size, nullptr, 0);
+    if (length == 0)
+        return false;
+    text.resize(length);
+    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(), size, &text[0], length) == length;
+}
+
+bool EncodeUtf8(const std::wstring &text, std::string &bytes)
+{
+    bytes.clear();
+    if (text.empty())
+        return true;
+    if (text.size() > static_cast<size_t>((std::numeric_limits<int>::max)()))
+        return false;
+    const int size = static_cast<int>(text.size());
+    const int length =
+        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), size, nullptr, 0, nullptr, nullptr);
+    if (length == 0)
+        return false;
+    bytes.resize(length);
+    return WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), size, &bytes[0], length, nullptr, nullptr) == length;
+}
+
 
 void PrintMessage(const wchar_t *format, ...)
 {
